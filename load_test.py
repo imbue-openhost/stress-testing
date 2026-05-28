@@ -76,26 +76,50 @@ class LevelResult:
         }
 
 
+def build_request(prompt: dict, max_tokens: int, backend: str, model: str) -> tuple[str, dict]:
+    """Build the URL path and request body for the given backend."""
+    if backend == "ollama":
+        prefix = prompt["input_prefix"]
+        suffix = prompt["input_suffix"]
+        return "/api/generate", {
+            "model": model,
+            "prompt": f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>",
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+        }
+    else:
+        return "/infill", {
+            "input_prefix": prompt["input_prefix"],
+            "input_suffix": prompt["input_suffix"],
+            "n_predict": max_tokens,
+            "stream": False,
+            "cache_prompt": True,
+        }
+
+
+def parse_response(data: dict, backend: str) -> int:
+    """Extract tokens_predicted from the response."""
+    if backend == "ollama":
+        return data.get("eval_count", 0)
+    return data.get("tokens_predicted", 0)
+
+
 async def send_request(
     session: aiohttp.ClientSession,
     endpoint: str,
     token: str,
     prompt_idx: int,
     max_tokens: int,
+    backend: str = "llama",
+    model: str = "",
 ) -> RequestResult:
     prompt = PROMPTS[prompt_idx % len(PROMPTS)]
-    body = {
-        "input_prefix": prompt["input_prefix"],
-        "input_suffix": prompt["input_suffix"],
-        "n_predict": max_tokens,
-        "stream": False,
-        "cache_prompt": True,
-    }
+    path, body = build_request(prompt, max_tokens, backend, model)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    url = endpoint.rstrip("/") + "/infill"
+    url = endpoint.rstrip("/") + path
     start = time.monotonic()
     try:
         async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
@@ -104,7 +128,7 @@ async def send_request(
             return RequestResult(
                 latency=round(elapsed, 3),
                 status=resp.status,
-                tokens_predicted=data.get("tokens_predicted", 0),
+                tokens_predicted=parse_response(data, backend),
             )
     except Exception as e:
         elapsed = time.monotonic() - start
@@ -119,11 +143,13 @@ async def simulate_user(
     num_requests: int,
     max_tokens: int,
     think_time: float,
+    backend: str = "llama",
+    model: str = "",
 ) -> list[RequestResult]:
     """Simulate a user making requests with pauses between them."""
     results = []
     for i in range(num_requests):
-        result = await send_request(session, endpoint, token, user_id * num_requests + i, max_tokens)
+        result = await send_request(session, endpoint, token, user_id * num_requests + i, max_tokens, backend, model)
         results.append(result)
         if i < num_requests - 1:
             await asyncio.sleep(think_time)
@@ -137,13 +163,15 @@ async def run_level(
     requests_per_user: int,
     max_tokens: int,
     think_time: float,
+    backend: str = "llama",
+    model: str = "",
 ) -> LevelResult:
     """Run a load test at a specific concurrency level."""
     ssl_ctx = ssl.create_default_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=concurrency + 5)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
-            simulate_user(session, endpoint, token, i, requests_per_user, max_tokens, think_time)
+            simulate_user(session, endpoint, token, i, requests_per_user, max_tokens, think_time, backend, model)
             for i in range(concurrency)
         ]
         all_results = await asyncio.gather(*tasks)
@@ -162,6 +190,8 @@ async def run_load_test(
     max_tokens: int,
     think_time: float,
     step: int,
+    backend: str = "llama",
+    model: str = "",
 ):
     levels = list(range(1, max_users + 1, step))
     if levels[-1] != max_users:
@@ -176,7 +206,7 @@ async def run_load_test(
 
     all_summaries = []
     for n in levels:
-        level = await run_level(endpoint, token, n, requests_per_user, max_tokens, think_time)
+        level = await run_level(endpoint, token, n, requests_per_user, max_tokens, think_time, backend, model)
         s = level.summary()
         all_summaries.append(s)
 
@@ -218,7 +248,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens per completion (default: 64)")
     parser.add_argument("--think-time", type=float, default=2.0, help="Seconds between requests per user (default: 2.0)")
     parser.add_argument("--step", type=int, default=2, help="Increment users by this many per level (default: 2)")
+    parser.add_argument("--backend", choices=["llama", "ollama"], default="llama", help="Backend type: llama (llama.cpp /infill) or ollama (/api/generate)")
+    parser.add_argument("--model", default="", help="Model name (required for ollama, e.g. qwen2.5-coder:1.5b)")
     args = parser.parse_args()
+
+    if args.backend == "ollama" and not args.model:
+        parser.error("--model is required when using --backend ollama")
 
     asyncio.run(run_load_test(
         endpoint=args.endpoint,
@@ -228,6 +263,8 @@ def main():
         max_tokens=args.max_tokens,
         think_time=args.think_time,
         step=args.step,
+        backend=args.backend,
+        model=args.model,
     ))
 
 
