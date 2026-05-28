@@ -76,8 +76,9 @@ class LevelResult:
         }
 
 
-def build_request(prompt: dict, max_tokens: int, backend: str, model: str) -> tuple[str, dict]:
-    """Build the URL path and request body for the given backend."""
+def build_request(prompt: dict, max_tokens: int, backend: str, model: str) -> tuple[str, dict, dict]:
+    """Build the URL path, request body, and extra headers for the given backend."""
+    extra_headers: dict = {}
     if backend == "ollama":
         prefix = prompt["input_prefix"]
         suffix = prompt["input_suffix"]
@@ -86,7 +87,26 @@ def build_request(prompt: dict, max_tokens: int, backend: str, model: str) -> tu
             "prompt": f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>",
             "stream": False,
             "options": {"num_predict": max_tokens},
-        }
+        }, extra_headers
+    elif backend == "anthropic":
+        prefix = prompt["input_prefix"]
+        suffix = prompt["input_suffix"]
+        fim_prompt = f"Complete the code between the prefix and suffix. Output ONLY the code that goes between them, nothing else.\n\nPrefix:\n```\n{prefix}\n```\n\nSuffix:\n```\n{suffix}\n```"
+        extra_headers["anthropic-version"] = "2023-06-01"
+        return "/v1/messages", {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": fim_prompt}],
+        }, extra_headers
+    elif backend == "openai":
+        prefix = prompt["input_prefix"]
+        suffix = prompt["input_suffix"]
+        fim_prompt = f"Complete the code between the prefix and suffix. Output ONLY the code that goes between them, nothing else.\n\nPrefix:\n```\n{prefix}\n```\n\nSuffix:\n```\n{suffix}\n```"
+        return "/v1/chat/completions", {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": fim_prompt}],
+        }, extra_headers
     else:
         return "/infill", {
             "input_prefix": prompt["input_prefix"],
@@ -94,13 +114,17 @@ def build_request(prompt: dict, max_tokens: int, backend: str, model: str) -> tu
             "n_predict": max_tokens,
             "stream": False,
             "cache_prompt": True,
-        }
+        }, extra_headers
 
 
 def parse_response(data: dict, backend: str) -> int:
     """Extract tokens_predicted from the response."""
     if backend == "ollama":
         return data.get("eval_count", 0)
+    elif backend == "anthropic":
+        return data.get("usage", {}).get("output_tokens", 0)
+    elif backend == "openai":
+        return data.get("usage", {}).get("completion_tokens", 0)
     return data.get("tokens_predicted", 0)
 
 
@@ -114,10 +138,14 @@ async def send_request(
     model: str = "",
 ) -> RequestResult:
     prompt = PROMPTS[prompt_idx % len(PROMPTS)]
-    path, body = build_request(prompt, max_tokens, backend, model)
+    path, body, extra_headers = build_request(prompt, max_tokens, backend, model)
     headers = {"Content-Type": "application/json"}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        if backend == "anthropic":
+            headers["x-api-key"] = token
+        else:
+            headers["Authorization"] = f"Bearer {token}"
+    headers.update(extra_headers)
 
     url = endpoint.rstrip("/") + path
     start = time.monotonic()
@@ -248,12 +276,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens per completion (default: 64)")
     parser.add_argument("--think-time", type=float, default=2.0, help="Seconds between requests per user (default: 2.0)")
     parser.add_argument("--step", type=int, default=2, help="Increment users by this many per level (default: 2)")
-    parser.add_argument("--backend", choices=["llama", "ollama"], default="llama", help="Backend type: llama (llama.cpp /infill) or ollama (/api/generate)")
+    parser.add_argument("--backend", choices=["llama", "ollama", "anthropic", "openai"], default="llama", help="Backend type: llama (/infill), ollama (/api/generate), anthropic (/v1/messages), openai (/v1/chat/completions)")
     parser.add_argument("--model", default="", help="Model name (required for ollama, e.g. qwen2.5-coder:1.5b)")
     args = parser.parse_args()
 
-    if args.backend == "ollama" and not args.model:
-        parser.error("--model is required when using --backend ollama")
+    if args.backend in ("ollama", "anthropic", "openai") and not args.model:
+        parser.error(f"--model is required when using --backend {args.backend}")
 
     asyncio.run(run_load_test(
         endpoint=args.endpoint,
