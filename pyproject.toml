@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stress-testing"
+version = "0.1.0"
+description = "Load testing tools for OpenHost services"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+load-test = "load_test:main"
+
+[tool.hatch.build.targets.wheel]
+# load_test.py is a standalone single-module tool, not a package.
+only-include = ["load_test.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["load_test.py", "README.md", "tests"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
