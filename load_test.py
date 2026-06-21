@@ -34,6 +34,29 @@ PROMPTS = [
 ]
 
 
+def percentile(values: list[float], q: float) -> float:
+    """Return the q-th percentile of *values* using linear interpolation.
+
+    ``q`` is a fraction in ``[0, 1]`` (e.g. ``0.9`` for p90). Interpolates
+    between the two closest ranks, matching numpy's default ("linear") method,
+    so that small samples do not collapse the high percentiles onto ``max``
+    (the old ``sorted(values)[int(len(values) * q)]`` indexing did).
+    """
+    if not values:
+        raise ValueError("percentile() arg is an empty sequence")
+    if not 0.0 <= q <= 1.0:
+        raise ValueError(f"q must be in [0, 1], got {q}")
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 1:
+        return float(ordered[0])
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
 @dataclass
 class RequestResult:
     latency: float
@@ -65,9 +88,9 @@ class LevelResult:
             "total_requests": len(self.results),
             "successes": len(self.successes),
             "failures": len(self.failures),
-            "latency_p50": round(statistics.median(latencies), 2),
-            "latency_p90": round(sorted(latencies)[int(len(latencies) * 0.9)], 2),
-            "latency_p99": round(sorted(latencies)[int(len(latencies) * 0.99)], 2),
+            "latency_p50": round(percentile(latencies, 0.50), 2),
+            "latency_p90": round(percentile(latencies, 0.90), 2),
+            "latency_p99": round(percentile(latencies, 0.99), 2),
             "latency_min": round(min(latencies), 2),
             "latency_max": round(max(latencies), 2),
             "latency_mean": round(statistics.mean(latencies), 2),
@@ -220,6 +243,8 @@ async def run_load_test(
     step: int,
     backend: str = "llama",
     model: str = "",
+    usable_p90: float = 3.0,
+    marginal_p90: float = 5.0,
 ):
     levels = list(range(1, max_users + 1, step))
     if levels[-1] != max_users:
@@ -263,7 +288,7 @@ async def run_load_test(
     print("Summary:")
     for s in all_summaries:
         if "error" not in s:
-            usable = "YES" if s["latency_p90"] < 3.0 else ("MARGINAL" if s["latency_p90"] < 5.0 else "NO")
+            usable = "YES" if s["latency_p90"] < usable_p90 else ("MARGINAL" if s["latency_p90"] < marginal_p90 else "NO")
             print(f"  {s['concurrency']} concurrent users: p90={s['latency_p90']}s, mean={s['latency_mean']}s -> {usable}")
 
 
@@ -278,10 +303,15 @@ def main():
     parser.add_argument("--step", type=int, default=2, help="Increment users by this many per level (default: 2)")
     parser.add_argument("--backend", choices=["llama", "ollama", "anthropic", "openai"], default="llama", help="Backend type: llama (/infill), ollama (/api/generate), anthropic (/v1/messages), openai (/v1/chat/completions)")
     parser.add_argument("--model", default="", help="Model name (required for ollama, e.g. qwen2.5-coder:1.5b)")
+    parser.add_argument("--usable-p90", type=float, default=3.0, help="p90 latency (s) below which a level is rated YES (default: 3.0)")
+    parser.add_argument("--marginal-p90", type=float, default=5.0, help="p90 latency (s) below which a level is rated MARGINAL, else NO (default: 5.0)")
     args = parser.parse_args()
 
     if args.backend in ("ollama", "anthropic", "openai") and not args.model:
         parser.error(f"--model is required when using --backend {args.backend}")
+
+    if args.marginal_p90 < args.usable_p90:
+        parser.error("--marginal-p90 must be >= --usable-p90")
 
     asyncio.run(run_load_test(
         endpoint=args.endpoint,
@@ -293,6 +323,8 @@ def main():
         step=args.step,
         backend=args.backend,
         model=args.model,
+        usable_p90=args.usable_p90,
+        marginal_p90=args.marginal_p90,
     ))
 
 
